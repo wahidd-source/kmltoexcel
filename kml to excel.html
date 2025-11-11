@@ -1,0 +1,268 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>KML → Excel Portable (1 file)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body{font-family:system-ui,Arial;margin:0;background:#f6f7fb}
+    .wrap{max-width:1000px;margin:24px auto;padding:0 16px}
+    .card{background:#fff;border:1px solid #ddd;border-radius:14px;padding:16px}
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    th,td{border-bottom:1px solid #eee;padding:6px 8px;text-align:left}
+    thead th{background:#f6f7fb;position:sticky;top:0}
+    .scroll{max-height:60vh;overflow:auto}
+    button{background:#111;color:#fff;border:0;border-radius:9999px;padding:8px 14px;font-weight:600;cursor:pointer}
+    button:disabled{opacity:.4;cursor:not-allowed}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h2>KML → Excel (Lat 9, Lon 10)</h2>
+      <p>Upload .kml → bersihin <code>Description</code> (hapus HTML, isi teks aja) → pecah folder → kolom koordinat: <b>Lat</b> (9 char) duluan, <b>Lon</b> (10 char) sesudahnya. Tanpa kata “Centroid”.</p>
+      <input id="file" type="file" accept=".kml,application/xml" />
+      <div id="status" style="margin-top:6px;color:#555"></div>
+    </div>
+
+    <div id="out" class="card" style="margin-top:16px;display:none">
+      <div style="display:flex;gap:8px;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <div id="count"></div>
+        <div>
+          <button id="btnCsv" disabled>Export CSV</button>
+          <button id="btnXls" disabled>Export XLS</button>
+        </div>
+      </div>
+      <div class="scroll">
+        <table>
+          <thead><tr id="thead"></tr></thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+<script>
+// ===== util dasar =====
+const fileEl = document.getElementById("file");
+const statusEl = document.getElementById("status");
+const outCard = document.getElementById("out");
+const thead = document.getElementById("thead");
+const tbody = document.getElementById("tbody");
+const countEl = document.getElementById("count");
+const btnCsv = document.getElementById("btnCsv");
+const btnXls = document.getElementById("btnXls");
+
+let gRows = [];
+let gCols = [];
+let gName = "";
+
+function txt(el){ return el && el.textContent ? el.textContent.trim() : null; }
+
+function stripHtmlKeepText(html){
+  if(!html) return "";
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  return (doc.body.textContent || "").replace(/[ \t]+/g, " ").trim();
+}
+
+function forceLen(val, len){
+  if(val === null || val === undefined) return "";
+  let s = String(val);
+  if(s.length > len) return s.slice(0, len);
+  if(s.length < len) return s + "0".repeat(len - s.length);
+  return s;
+}
+
+function parseCoords(s){
+  if(!s) return [];
+  const out = [];
+  s.replace(/\s+/g, " ").trim().split(" ").forEach(part => {
+    if(!part) return;
+    const [lonStr, latStr] = part.split(",");
+    if(lonStr !== undefined && latStr !== undefined){
+      const lon = Number(lonStr);
+      const lat = Number(latStr);
+      if(!Number.isNaN(lon) && !Number.isNaN(lat)){
+        out.push([lon, lat]);
+      }
+    }
+  });
+  return out;
+}
+
+function centroid(points){
+  if(!points.length) return {lon:null,lat:null};
+  let sx=0, sy=0;
+  points.forEach(p => { sx += p[0]; sy += p[1]; });
+  return {lon: sx/points.length, lat: sy/points.length};
+}
+
+function gatherCoords(placemark){
+  let coords = [];
+  placemark.querySelectorAll("coordinates").forEach(c => {
+    coords = coords.concat(parseCoords(c.textContent));
+  });
+  return coords;
+}
+
+// jalanin turunannya tanpa :scope biar aman
+function walk(node, path, out){
+  // placemark di level ini
+  node.childNodes.forEach(ch => {
+    if(ch.nodeType === 1 && ch.localName === "Placemark"){
+      const name = txt(ch.getElementsByTagName("name")[0]);
+      const rawDesc = txt(ch.getElementsByTagName("description")[0]);
+      const desc = stripHtmlKeepText(rawDesc);
+      const coords = gatherCoords(ch);
+      const c = centroid(coords);
+
+      // WAJIB: Lat duluan 9 char, Lon 10 char
+      const lat = c.lat === null ? "" : forceLen(c.lat, 9);
+      const lon = c.lon === null ? "" : forceLen(c.lon, 10);
+
+      out.push({
+        FolderPath: path.join("/"),
+        PlacemarkName: name || "",
+        Description: desc || "",
+        Lat: lat,
+        Lon: lon
+      });
+    }
+  });
+
+  // folder di level ini
+  node.childNodes.forEach(ch => {
+    if(ch.nodeType === 1 && ch.localName === "Folder"){
+      const fname = txt(ch.getElementsByTagName("name")[0]) || "Folder";
+      walk(ch, path.concat([fname]), out);
+    }
+  });
+}
+
+function addFolderColumns(rows){
+  let maxDepth = 0;
+  const splits = rows.map(r => r.FolderPath ? r.FolderPath.split("/").map(s => s.trim()) : []);
+  splits.forEach(parts => { if(parts.length > maxDepth) maxDepth = parts.length; });
+  const cols = Array.from({length:maxDepth}, (_,i)=>"Folder"+(i+1));
+  const newRows = rows.map((r, idx) => {
+    const parts = splits[idx];
+    const o = {...r};
+    cols.forEach((c,i) => { o[c] = parts[i] || ""; });
+    return o;
+  });
+  return { rows: newRows, cols };
+}
+
+function renderTable(rows){
+  outCard.style.display = "block";
+  countEl.textContent = rows.length + " placemark";
+
+  const keys = Object.keys(rows[0] || {});
+  const folderCols = keys
+    .filter(k => /^Folder\d+$/.test(k))
+    .sort((a,b) => Number(a.slice(6)) - Number(b.slice(6)));
+
+  // urutan final
+  const ordered = ["FolderPath", ...folderCols, "PlacemarkName", "Description", "Lat", "Lon"];
+  gCols = ordered;
+
+  btnCsv.disabled = !rows.length;
+  btnXls.disabled = !rows.length;
+
+  thead.innerHTML = "";
+  ordered.forEach(c => {
+    const th = document.createElement("th");
+    th.textContent = c;
+    thead.appendChild(th);
+  });
+
+  tbody.innerHTML = "";
+  rows.slice(0, 1000).forEach(r => {
+    const tr = document.createElement("tr");
+    ordered.forEach(c => {
+      const td = document.createElement("td");
+      td.textContent = r[c] == null ? "" : r[c];
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+}
+
+fileEl.addEventListener("change", async (e)=>{
+  const f = e.target.files[0];
+  if(!f) return;
+  gName = f.name;
+  statusEl.textContent = "Parsing KML...";
+  try{
+    const textKml = await f.text();
+    const xml = new DOMParser().parseFromString(textKml, "application/xml");
+    if(xml.querySelector("parsererror")) throw new Error("KML tidak valid");
+    const root = xml.getElementsByTagName("Document")[0] || xml.documentElement;
+    const docName = txt(root.getElementsByTagName("name")[0]) || "Document";
+    const arr = [];
+    walk(root, [docName], arr);
+    const {rows} = addFolderColumns(arr);
+    gRows = rows;
+    renderTable(gRows);
+    statusEl.textContent = "Sukses.";
+  }catch(err){
+    console.error(err);
+    statusEl.textContent = "Error: " + err.message;
+  }
+});
+
+function download(blob, filename){
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, 0);
+}
+
+function makeCsv(rows, cols){
+  const esc = v => {
+    if(v == null) return "";
+    const s = String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g,'""')}"` : s;
+  };
+  const lines = [];
+  lines.push(cols.map(esc).join(","));
+  rows.forEach(r => {
+    lines.push(cols.map(c => esc(r[c])).join(","));
+  });
+  return lines.join("\n");
+}
+
+btnCsv.addEventListener("click", ()=>{
+  const csv = makeCsv(gRows, gCols);
+  const name = (gName || "export").replace(/\.[^/.]+$/, "") + "_clean.csv";
+  download(new Blob([csv], {type:"text/csv"}), name);
+});
+
+btnXls.addEventListener("click", ()=>{
+  const esc = s => String(s || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  const header = "<Row>" + gCols.map(c => `<Cell><Data ss:Type="String">${esc(c)}</Data></Cell>`).join("") + "</Row>";
+  const body = gRows.map(r => {
+    return "<Row>" + gCols.map(c => `<Cell><Data ss:Type="String">${esc(r[c])}</Data></Cell>`).join("") + "</Row>";
+  }).join("");
+  const xml = `<?xml version="1.0"?>
+<?mso-application progid="Excel.Sheet"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
+  <Worksheet ss:Name="Placemarks">
+    <Table>
+      ${header}
+      ${body}
+    </Table>
+  </Worksheet>
+</Workbook>`;
+  const name = (gName || "export").replace(/\.[^/.]+$/, "") + "_clean.xls";
+  download(new Blob([xml], {type:"application/vnd.ms-excel"}), name);
+});
+</script>
+</body>
+</html>
